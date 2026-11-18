@@ -46,6 +46,9 @@ void DLLINTERNAL main_hook_function_void(unsigned int api_info_offset, enum_api_
 // full return typed version of main hook function
 void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int api_info_offset, enum_api_t api, unsigned int func_offset, const void* packed_args);
 
+// remember the engine's main thread (called from GiveFnptrsToDll)
+void DLLINTERNAL MetaHook_InitMainThread(void);
+
 //
 // API function args structures/classes
 //

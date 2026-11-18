@@ -34,6 +34,7 @@
 #include "h_export.h" // me
 #include "metamod.h"  // engine_t, etc
 #include "log_meta.h" // META_DEV, etc
+#include "api_hook.h" // MetaHook_InitMainThread
 #include "osdep_p.h"  // get_module_handle_of_memptr
 
 // From SDK dlls/h_export.cpp:
@@ -91,6 +92,8 @@ engine_t         Engine;
 // is actually all done in meta_startup().
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t* pGlobals)
 {
+    MetaHook_InitMainThread();
+
 #ifdef linux
     metamod_handle = get_module_handle_of_memptr((void*)&g_engfuncs);
 #endif

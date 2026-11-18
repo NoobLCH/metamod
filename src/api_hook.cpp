@@ -32,6 +32,14 @@
 #include <stddef.h> // offsetof
 #include <extdll.h>
 
+#ifdef linux
+#    include <sys/syscall.h>
+#    include <unistd.h>
+#    define META_CURRENT_THREAD_ID() ((unsigned long)syscall(SYS_gettid))
+#else
+#    define META_CURRENT_THREAD_ID() ((unsigned long)GetCurrentThreadId())
+#endif
+
 #include "ret_type.h"
 #include "types_meta.h"
 #include "api_info.h"
@@ -54,6 +62,37 @@ static const void** api_info_tables[4] = {
     (const void**)&newapi_info,
     (const void**)&studioapi_info,
 };
+
+// Engine main thread id, used to detect illegal hook calls from worker threads
+// (bot/AI/DB/HTTP plugins). 0 means "not initialized yet".
+static unsigned long s_main_thread_id = 0;
+
+void DLLINTERNAL MetaHook_InitMainThread(void)
+{
+    s_main_thread_id = META_CURRENT_THREAD_ID();
+}
+
+static void MetaHook_CheckThread(const char* hook_name)
+{
+    unsigned long current = META_CURRENT_THREAD_ID();
+    if (s_main_thread_id != 0 && current != s_main_thread_id)
+    {
+        META_ERROR("hook %s called from non-main thread %lu (main thread %lu)", hook_name, current, s_main_thread_id);
+    }
+}
+
+// Verify that a plugin callback did not corrupt PublicMetaGlobals.orig_ret.
+// metamod always assigns it right before the callback, so any change here means
+// the callback (or something it called) wrote to the metamod global.
+static void MetaHook_CheckOrigRet(const char* plugin_file, const char* hook_name, bool is_post, const void* expected)
+{
+    if (PublicMetaGlobals.orig_ret != expected)
+    {
+        META_ERROR("orig_ret changed during %s:%s%s(): %p -> %p (thread %lu)",
+            plugin_file, hook_name, is_post ? "_Post" : "", expected,
+            PublicMetaGlobals.orig_ret, META_CURRENT_THREAD_ID());
+    }
+}
 
 // Safety check for metamod-bot-plugin bugfix.
 //  engine_api->pfnRunPlayerMove calls dllapi-functions before it returns.
@@ -88,6 +127,7 @@ void DLLINTERNAL main_hook_function_void(unsigned int api_info_offset, enum_api_
 
     //passing offset from api wrapper function makes code faster/smaller
     api_info = get_api_info(api, api_info_offset);
+    MetaHook_CheckThread(api_info->name);
 
     //Fix bug with metamod-bot-plugins.
     if (unlikely(call_count++ > 0))
@@ -235,6 +275,7 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
 
     //passing offset from api wrapper function makes code faster/smaller
     api_info = get_api_info(api, api_info_offset);
+    MetaHook_CheckThread(api_info->name);
 
     //Fix bug with metamod-bot-plugins.
     if (unlikely(call_count++ > 0))
@@ -277,6 +318,7 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
         PublicMetaGlobals.status    = status;
         pub_orig_ret                = orig_ret;
         PublicMetaGlobals.orig_ret  = pub_orig_ret.getptr();
+        const void* expected_orig   = PublicMetaGlobals.orig_ret;
         if (unlikely(status == MRES_SUPERCEDE))
         {
             pub_override_ret               = override_ret;
@@ -287,6 +329,7 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
         META_DEBUG(loglevel, ("Calling %s:%s()", iplug->file, api_info->name));
         dllret = class_ret_t(api_info->api_caller(pfn_routine, packed_args));
         API_UNPAUSE_TSC_TRACKING();
+        MetaHook_CheckOrigRet(iplug->file, api_info->name, false, expected_orig);
 
         // plugin's result code
         mres = PublicMetaGlobals.mres;
@@ -371,6 +414,7 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
         PublicMetaGlobals.status    = status;
         pub_orig_ret                = orig_ret;
         PublicMetaGlobals.orig_ret  = pub_orig_ret.getptr();
+        const void* expected_orig   = PublicMetaGlobals.orig_ret;
         if (unlikely(status == MRES_OVERRIDE))
         {
             pub_override_ret               = override_ret;
@@ -381,6 +425,7 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
         META_DEBUG(loglevel, ("Calling %s:%s_Post()", iplug->file, api_info->name));
         dllret = class_ret_t(api_info->api_caller(pfn_routine, packed_args));
         API_UNPAUSE_TSC_TRACKING();
+        MetaHook_CheckOrigRet(iplug->file, api_info->name, true, expected_orig);
 
         // plugin's result code
         mres = PublicMetaGlobals.mres;
@@ -408,6 +453,10 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
     if (unlikely(--call_count > 0))
     {
         //Restore backup
+        if (backup_meta_globals[0].orig_ret == NULL && orig_ret.getptr() != NULL)
+        {
+            META_ERROR("restoring NULL orig_ret for %s (nested hook backup was zero)", api_info->name);
+        }
         PublicMetaGlobals = backup_meta_globals[0];
     }
 
