@@ -31,12 +31,15 @@
 
 #include <stddef.h> // offsetof
 #include <extdll.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #ifdef linux
 #    include <sys/syscall.h>
 #    include <unistd.h>
 #    define META_CURRENT_THREAD_ID() ((unsigned long)syscall(SYS_gettid))
 #else
+#    include <windows.h>
 #    define META_CURRENT_THREAD_ID() ((unsigned long)GetCurrentThreadId())
 #endif
 
@@ -63,8 +66,7 @@ static const void** api_info_tables[4] = {
     (const void**)&studioapi_info,
 };
 
-// Engine main thread id, used to detect illegal hook calls from worker threads
-// (bot/AI/DB/HTTP plugins). 0 means "not initialized yet".
+// Engine main thread id. 0 means "not initialized yet".
 static unsigned long s_main_thread_id = 0;
 
 void DLLINTERNAL MetaHook_InitMainThread(void)
@@ -72,25 +74,76 @@ void DLLINTERNAL MetaHook_InitMainThread(void)
     s_main_thread_id = META_CURRENT_THREAD_ID();
 }
 
-static void MetaHook_CheckThread(const char* hook_name)
+// Diagnostics must never call META_ERROR/ALERT from inside a hook:
+// ALERT -> pfnAlertMessage -> metamod AlertMessage hook -> this code again,
+// which turns a single diagnostic into an endless re-entrant log storm.
+// Write directly to a separate file instead.
+static void MetaHook_LogDiag(const char* fmt, ...)
 {
-    unsigned long current = META_CURRENT_THREAD_ID();
-    if (s_main_thread_id != 0 && current != s_main_thread_id)
+    va_list ap;
+    va_start(ap, fmt);
+    FILE* fp = fopen("metamod_diag.log", "a+");
+    if (fp)
     {
-        META_ERROR("hook %s called from non-main thread %lu (main thread %lu)", hook_name, current, s_main_thread_id);
+        vfprintf(fp, fmt, ap);
+        fputc('\n', fp);
+        fclose(fp);
     }
+    va_end(ap);
+}
+
+// Log the first non-main-thread hook call per thread, with a raw backtrace so
+// we can identify the offending plugin/worker thread offline.
+static void MetaHook_LogNonMainThreadOnce(const char* hook_name)
+{
+#ifdef linux
+    static __thread bool logged = false;
+#else
+    static __declspec(thread) bool logged = false;
+#endif
+    if (logged)
+    {
+        return;
+    }
+    logged = true;
+
+    MetaHook_LogDiag("[META] non-main thread %lu (main %lu) called hook %s",
+        META_CURRENT_THREAD_ID(), s_main_thread_id, hook_name);
+
+#ifndef linux
+    void* frames[32];
+    USHORT count = CaptureStackBackTrace(1, 32, frames, NULL);
+    for (USHORT i = 0; i < count; ++i)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(frames[i], &mbi, sizeof(mbi)) == sizeof(mbi))
+        {
+            char path[MAX_PATH] = { 0 };
+            GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, MAX_PATH);
+            MetaHook_LogDiag("  #%u %p %s+0x%X", i, frames[i], path,
+                (unsigned)((DWORD_PTR)frames[i] - (DWORD_PTR)mbi.AllocationBase));
+        }
+        else
+        {
+            MetaHook_LogDiag("  #%u %p <unknown>", i, frames[i]);
+        }
+    }
+#endif
 }
 
 // Verify that a plugin callback did not corrupt PublicMetaGlobals.orig_ret.
-// metamod always assigns it right before the callback, so any change here means
-// the callback (or something it called) wrote to the metamod global.
+// This is rare; log directly to file (not via ALERT) and cap the output.
 static void MetaHook_CheckOrigRet(const char* plugin_file, const char* hook_name, bool is_post, const void* expected)
 {
     if (PublicMetaGlobals.orig_ret != expected)
     {
-        META_ERROR("orig_ret changed during %s:%s%s(): %p -> %p (thread %lu)",
-            plugin_file, hook_name, is_post ? "_Post" : "", expected,
-            PublicMetaGlobals.orig_ret, META_CURRENT_THREAD_ID());
+        static int logCount = 0;
+        if (logCount++ < 100)
+        {
+            MetaHook_LogDiag("[META] orig_ret changed during %s:%s%s(): %p -> %p (thread %lu)",
+                plugin_file, hook_name, is_post ? "_Post" : "", expected,
+                PublicMetaGlobals.orig_ret, META_CURRENT_THREAD_ID());
+        }
     }
 }
 
@@ -127,7 +180,24 @@ void DLLINTERNAL main_hook_function_void(unsigned int api_info_offset, enum_api_
 
     //passing offset from api wrapper function makes code faster/smaller
     api_info = get_api_info(api, api_info_offset);
-    MetaHook_CheckThread(api_info->name);
+
+    // Metamod hooks are main-thread only. Worker threads calling engine APIs
+    // must bypass plugin dispatch: call_count/PublicMetaGlobals are globals,
+    // and a worker-thread restore would clobber the main thread's hook state.
+    if (unlikely(s_main_thread_id != 0 && META_CURRENT_THREAD_ID() != s_main_thread_id))
+    {
+        MetaHook_LogNonMainThreadOnce(api_info->name);
+        const void** table = api_tables[api];
+        if (table && *table)
+        {
+            const void* pfn = get_api_function(*table, func_offset);
+            if (pfn)
+            {
+                api_info->api_caller(pfn, packed_args);
+            }
+        }
+        return;
+    }
 
     //Fix bug with metamod-bot-plugins.
     if (unlikely(call_count++ > 0))
@@ -275,7 +345,25 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
 
     //passing offset from api wrapper function makes code faster/smaller
     api_info = get_api_info(api, api_info_offset);
-    MetaHook_CheckThread(api_info->name);
+
+    // Metamod hooks are main-thread only. Worker threads calling engine APIs
+    // must bypass plugin dispatch: call_count/PublicMetaGlobals are globals,
+    // and a worker-thread restore would clobber the main thread's hook state.
+    if (unlikely(s_main_thread_id != 0 && META_CURRENT_THREAD_ID() != s_main_thread_id))
+    {
+        MetaHook_LogNonMainThreadOnce(api_info->name);
+        class_ret_t direct_ret = ret_init;
+        const void** table = api_tables[api];
+        if (table && *table)
+        {
+            const void* pfn = get_api_function(*table, func_offset);
+            if (pfn)
+            {
+                direct_ret = class_ret_t(api_info->api_caller(pfn, packed_args));
+            }
+        }
+        return (*(void**)direct_ret.getptr());
+    }
 
     //Fix bug with metamod-bot-plugins.
     if (unlikely(call_count++ > 0))
@@ -453,10 +541,6 @@ void* DLLINTERNAL main_hook_function(const class_ret_t ret_init, unsigned int ap
     if (unlikely(--call_count > 0))
     {
         //Restore backup
-        if (backup_meta_globals[0].orig_ret == NULL && orig_ret.getptr() != NULL)
-        {
-            META_ERROR("restoring NULL orig_ret for %s (nested hook backup was zero)", api_info->name);
-        }
         PublicMetaGlobals = backup_meta_globals[0];
     }
 
